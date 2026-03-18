@@ -1,22 +1,36 @@
 """
 Custom Agent: create-submission-agent-em
 
-Runs every Python file in the workspace folder as a separate step.
-Each script must accept --train-dataset-path and --test-dataset-path arguments
-and produce a submission_<script_stem>.csv file.
+Iterates over Python files in <code_folder> (one file = one step), sorted
+alphabetically. Runs at most max_steps scripts; stops when all files are done.
 
-After each script runs, the submission is validated against the sample submission
-and graded (MAE for ventilator-pressure-prediction). Results are reported to Emily.
+Each script must accept:
+    --train-dataset-path        path to train CSV
+    --test-dataset-path         path to competition test CSV
+    --output-submission-path    where to write the submission CSV
+    (+ any additional_args)
+
+After each script the agent validates and grades the submission, then reports
+the MAE score to Emily via send_iteration_result.
 
 agent_config fields:
-    competition_id       (str)  Competition folder name, e.g. "ventilator-pressure-prediction"
-    train_dataset_path   (str)  Path to train CSV. Defaults to <workspace>/train.csv
-    additional_args      (list) Extra CLI args appended to every script invocation
+    competition_id       (str)   Competition folder name.
+                                 Default: "ventilator-pressure-prediction"
+    code_folder_path     (str)   Path to the folder containing scripts to run.
+                                 Absolute, or relative to the agent script.
+                                 Default: <workspace>/codes
+    train_dataset_path   (str)   Path to train CSV.
+                                 Default: <workspace>/train.csv
+    additional_args      (list)  Extra CLI args appended to every invocation.
+                                 Default: []
 """
 
 import importlib.util
+import json
 import subprocess
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -46,6 +60,80 @@ def _get_workspace_dir() -> Path:
 
 def _get_competition_dir(competition_id: str) -> Path:
     return _get_base_dir() / competition_id
+
+
+# ---------------------------------------------------------------------------
+# Archive extraction
+# ---------------------------------------------------------------------------
+
+def _extract_archives(code_folder: Path) -> None:
+    """
+    Extract any zip / tar / tar.gz / tgz / tar.bz2 / gz archives found
+    directly in code_folder, then flatten all resulting .py files to the
+    root of code_folder (overwrite on name collision).
+    Archives and temporary sub-directories are removed after extraction.
+    """
+    import gzip
+    import shutil
+    import tarfile
+    import zipfile
+
+    ARCHIVE_SUFFIXES = {".zip", ".tar", ".gz", ".tgz", ".bz2"}
+
+    archives = [
+        f for f in code_folder.iterdir()
+        if f.is_file() and f.suffix.lower() in ARCHIVE_SUFFIXES
+    ]
+
+    if not archives:
+        return
+
+    for archive in archives:
+        tmp_dir = code_folder / f"_tmp_{archive.stem}"
+        tmp_dir.mkdir()
+        name = archive.name.lower()
+
+        try:
+            if name.endswith(".zip"):
+                with zipfile.ZipFile(archive) as zf:
+                    zf.extractall(tmp_dir)
+
+            elif name.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tar")):
+                with tarfile.open(archive) as tf:
+                    tf.extractall(tmp_dir)
+
+            elif name.endswith(".gz"):
+                # Single-file gzip (e.g. script.py.gz)
+                out_name = archive.stem  # strips the .gz
+                with gzip.open(archive, "rb") as gz_in:
+                    (tmp_dir / out_name).write_bytes(gz_in.read())
+
+            print(f"  [extract] {archive.name} → {tmp_dir.name}/")
+
+            # Flatten: move every .py file from the extracted tree to code_folder
+            for py_file in tmp_dir.rglob("*.py"):
+                dest = code_folder / py_file.name
+                shutil.move(str(py_file), str(dest))
+                print(f"    ← {py_file.relative_to(tmp_dir)}  →  {dest.name}")
+
+            # Clean up macOS AppleDouble metadata files (._foo.py) injected by
+            # Finder/Archive Utility. If the real foo.py also exists → delete ._foo.py.
+            # If only ._foo.py exists (edge case) → rename it to foo.py.
+            for dot_file in list(code_folder.glob("._*.py")):
+                real_name = dot_file.name[2:]  # strip leading ._
+                real_file = code_folder / real_name
+                if real_file.exists():
+                    dot_file.unlink()
+                    print(f"    [cleanup] removed macOS metadata file: {dot_file.name}")
+                else:
+                    dot_file.rename(real_file)
+                    print(f"    [cleanup] renamed {dot_file.name} → {real_name}")
+
+        except Exception as e:
+            print(f"  [extract] WARNING: could not extract {archive.name}: {e}")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            archive.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -130,18 +218,18 @@ def _validate_and_grade(
 
 class CreateSubmissionAgentEmAgent(BaseAgent):
     """
-    For each Python file in workspace (one file per step):
+    For each Python file in <code_folder> (alphabetical, one file per step):
       1. Runs:  python <file>
-                  --train-dataset-path <train>
-                  --test-dataset-path  <test>
-                  --output-submission-path <workspace>/submissions/submission_<stem>.csv
-                  [extra_args]
+                  --train-dataset-path      <train>
+                  --test-dataset-path       <test>
+                  --output-submission-path  <workspace>/submissions/submission_<stem>.csv
+                  [additional_args]
       2. Reads the submission from the explicit output path it just passed
       3. Validates & grades submission
       4. Reports score to Emily via send_iteration_result / send_experiment_completed
 
-    Scripts must honour --output-submission-path so they can also be run
-    standalone locally with a custom path.
+    Stops after min(max_steps, len(scripts)) steps — never loops beyond available files.
+    Scripts must honour --output-submission-path so they can also be run standalone.
     """
 
     async def start(self):
@@ -153,6 +241,16 @@ class CreateSubmissionAgentEmAgent(BaseAgent):
         workspace_dir = _get_workspace_dir()
         competition_dir = _get_competition_dir(competition_id)
 
+        # Code folder: explicit config, or default to workspace/codes
+        raw_code_folder = self.agent_config.get("code_folder_path")
+        if raw_code_folder:
+            code_folder = Path(raw_code_folder)
+            if not code_folder.is_absolute():
+                # Relative paths are anchored to the project root (same as workspace)
+                code_folder = _get_base_dir() / code_folder
+        else:
+            code_folder = workspace_dir / "codes"
+
         # Paths inside competition folder
         test_dataset_path = competition_dir / "test.csv"
         sample_submission_path = competition_dir / "sample_submission.csv"
@@ -160,20 +258,36 @@ class CreateSubmissionAgentEmAgent(BaseAgent):
         grade_py_path = competition_dir / "grade.py"
 
         # train dataset: explicit config or default to workspace/train.csv
-        train_dataset_path = Path(
-            self.agent_config.get("train_dataset_path", str(workspace_dir / "train.csv"))
-        )
+        raw_train_path = self.agent_config.get("train_dataset_path")
+        if raw_train_path:
+            train_dataset_path = Path(raw_train_path)
+            if not train_dataset_path.is_absolute():
+                train_dataset_path = _get_base_dir() / train_dataset_path
+        else:
+            train_dataset_path = workspace_dir / "train.csv"
 
-        # Submissions land in workspace/submissions/
-        submissions_dir = workspace_dir / "submissions"
-        submissions_dir.mkdir(parents=True, exist_ok=True)
+        def _make_run_dir(base_name: str) -> Path:
+            candidate = workspace_dir / base_name
+            if candidate.exists():
+                ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                candidate = workspace_dir / f"{base_name}_{ts}"
+            candidate.mkdir(parents=True)
+            return candidate
 
-        # Collect Python files in workspace (sorted = deterministic order)
-        python_files: List[Path] = sorted(workspace_dir.glob("*.py"))
+        submissions_dir = _make_run_dir(f"submissions_{self.experiment_id}")
+        grid_dir = _make_run_dir(f"grid_{self.experiment_id}")
 
+        # Extract any archives in code folder before iterating
+        _extract_archives(code_folder)
+
+        # Collect Python files in code folder (alphabetical = deterministic order)
+        python_files: List[Path] = sorted(code_folder.glob("*.py"))
+
+        # Run at most max_steps scripts; stop when files are exhausted
         effective_steps = min(self.max_steps, len(python_files))
 
         print(f"Workspace:        {workspace_dir}")
+        print(f"Code folder:      {code_folder}  ({len(python_files)} script(s))")
         print(f"Submissions dir:  {submissions_dir}")
         print(f"Competition dir:  {competition_dir}")
         print(f"Train dataset:    {train_dataset_path}")
@@ -188,7 +302,7 @@ class CreateSubmissionAgentEmAgent(BaseAgent):
             ),
             user_message=(
                 f"Competition: {competition_id}\n"
-                f"Running {effective_steps} script(s) from workspace.\n"
+                f"Running {effective_steps}/{len(python_files)} script(s) from {code_folder.name}.\n"
                 f"Train data: {train_dataset_path}\n"
                 f"Test data:  {test_dataset_path}"
             ),
@@ -243,7 +357,9 @@ class CreateSubmissionAgentEmAgent(BaseAgent):
             observation_lines = [f"$ {' '.join(cmd)}\n"]
             score: Optional[float] = None
             error_msg: Optional[str] = None
+            elapsed_seconds: Optional[float] = None
 
+            t0 = time.monotonic()
             try:
                 proc = subprocess.run(
                     cmd,
@@ -251,6 +367,7 @@ class CreateSubmissionAgentEmAgent(BaseAgent):
                     text=True,
                     timeout=7200,  # 2 hours per script
                 )
+                elapsed_seconds = round(time.monotonic() - t0, 2)
                 stdout = proc.stdout.strip()
                 stderr = proc.stderr.strip()
 
@@ -258,15 +375,17 @@ class CreateSubmissionAgentEmAgent(BaseAgent):
                     observation_lines.append(f"[stdout]\n{stdout}")
                 if stderr:
                     observation_lines.append(f"[stderr]\n{stderr}")
-                observation_lines.append(f"\nExit code: {proc.returncode}")
+                observation_lines.append(f"\nExit code: {proc.returncode}  ({elapsed_seconds}s)")
 
                 if proc.returncode != 0:
                     error_msg = f"Script exited with code {proc.returncode}"
 
             except subprocess.TimeoutExpired:
+                elapsed_seconds = round(time.monotonic() - t0, 2)
                 observation_lines.append("TIMEOUT: script exceeded 2-hour limit")
                 error_msg = "Script timed out"
             except Exception as e:
+                elapsed_seconds = round(time.monotonic() - t0, 2)
                 observation_lines.append(f"ERROR launching script: {e}")
                 error_msg = str(e)
 
@@ -289,6 +408,20 @@ class CreateSubmissionAgentEmAgent(BaseAgent):
 
             observation = "\n".join(observation_lines)
             print(observation)
+
+            # --- Write grid JSON ---
+            grid_entry = {
+                "python_file": str(py_file),
+                "submission_file": str(submission_path) if submission_path.exists() else None,
+                "score": score,
+                "format_valid": format_valid,
+                "grade_message": grade_msg,
+                "execution_time_seconds": elapsed_seconds,
+                "error": error_msg,
+            }
+            grid_path = grid_dir / f"metric_{py_file.stem}.json"
+            grid_path.write_text(json.dumps(grid_entry, indent=2))
+            print(f"  [grid] {grid_path.name} written")
 
             # Track best (lower MAE is better)
             if score is not None:

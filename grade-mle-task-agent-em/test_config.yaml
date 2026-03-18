@@ -1,0 +1,25 @@
+EXPERIMENT_ID: "local-test-001"
+PROJECT_ID: "local-project"
+
+TASK_DESCRIPTION: "Run all workspace scripts and produce submission CSVs for ventilator-pressure-prediction"
+
+MAX_ITERATIONS: 10
+
+# Optional: override API keys (defaults to environment variables)
+# ANTHROPIC_API_KEY: "sk-ant-..."
+
+AGENT_CONFIG:
+  competition_id: "ventilator-pressure-prediction"
+
+  # Folder containing the scripts to run (one script = one step).
+  # Absolute path, or relative to the agent script.
+  # Defaults to workspace/codes if omitted.
+  code_folder_path: "workspace/codes"
+
+  # Path to the training CSV. Defaults to workspace/train.csv if omitted.
+  train_dataset_path: "workspace/data/train_2b.csv"
+
+  # Extra args appended to every script invocation.
+  additional_args:
+    - "--epochs"
+    - "5"

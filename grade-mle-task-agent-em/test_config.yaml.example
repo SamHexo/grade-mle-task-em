@@ -1,6 +1,3 @@
-# Local test configuration for create-submission-agent-em
-# Copy this to test_config.yaml and fill in your values.
-
 EXPERIMENT_ID: "local-test-001"
 PROJECT_ID: "local-project"
 
@@ -14,12 +11,15 @@ MAX_ITERATIONS: 10
 AGENT_CONFIG:
   competition_id: "ventilator-pressure-prediction"
 
+  # Folder containing the scripts to run (one script = one step).
+  # Absolute path, or relative to the agent script.
+  # Defaults to workspace/codes if omitted.
+  # code_folder_path: "workspace/codes"
+
   # Path to the training CSV. Defaults to workspace/train.csv if omitted.
   # train_dataset_path: "workspace/train.csv"
 
   # Extra args appended to every script invocation (optional).
   # additional_args:
   #   - "--epochs"
-  #   - "50"
-  #   - "--learning-rate"
-  #   - "0.001"
+  #   - "5"

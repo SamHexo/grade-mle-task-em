@@ -128,13 +128,13 @@ Use the Emily CLI to build your agent:
 
 ```bash
 # From the parent directory
-emily custom-agent build create-sumbission-agent-em
+emily custom-agent build grade-mle-task-agent-em
 
 # Or with custom tag
-emily custom-agent build create-sumbission-agent-em -t my-custom-tag:v1.0
+emily custom-agent build grade-mle-task-agent-em -t my-custom-tag:v1.0
 
 # Or with custom base image
-emily custom-agent build create-sumbission-agent-em --base-image emily/byoa-base:v2.0
+emily custom-agent build grade-mle-task-agent-em --base-image emily/byoa-base:v2.0
 ```
 
 This will:
@@ -147,13 +147,13 @@ This will:
 ### 5. Run Your Agent
 
 ```bash
-docker run -it emily/create-sumbission-agent-em:latest
+docker run -it emily/grade-mle-task-agent-em:latest
 ```
 
 ## Agent Structure
 
 ```
-create-sumbission-agent-em/
+grade-mle-task-agent-em/
 ├── base_agent.py      # Base class with webhook helpers (from Emily CLI)
 ├── models.py          # Pydantic models for messages (from Emily CLI)
 ├── custom_agent.py    # YOUR IMPLEMENTATION
@@ -277,8 +277,8 @@ The agent uses `emily/byoa-base:latest` which includes:
 1. Implement your agent logic in `custom_agent.py`
 2. Add any additional dependencies to `requirements.txt`
 3. Test locally with a Python virtual environment
-4. Build Docker image: `emily custom-agent build create-sumbission-agent-em`
-5. Test Docker image: `docker run -it emily/create-sumbission-agent-em:latest`
+4. Build Docker image: `emily custom-agent build grade-mle-task-agent-em`
+5. Test Docker image: `docker run -it emily/grade-mle-task-agent-em:latest`
 6. Register with Emily platform
 
 ## Support
