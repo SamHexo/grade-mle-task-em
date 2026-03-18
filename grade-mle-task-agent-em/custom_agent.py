@@ -23,11 +23,24 @@ agent_config fields:
                                  Default: <workspace>/train.csv
     additional_args      (list)  Extra CLI args appended to every invocation.
                                  Default: []
+    parallelism          (int)   Number of scripts to run simultaneously.
+                                 Scripts are batched in groups of this size;
+                                 within a batch all run concurrently and results
+                                 are reported as each one finishes.
+                                 Default: 1 (sequential)
+    timeout_per_script   (int)   Hard timeout in seconds per script.
+                                 The subprocess is killed if it exceeds this.
+                                 Default: 7200 (2 hours)
+    max_ram_gb           (float) Kill a script if its RAM usage (RSS, including
+                                 child processes) exceeds this many GB.
+                                 Default: None (no limit)
+    ram_check_interval   (float) How often (seconds) to poll RAM usage.
+                                 Default: 5.0
 """
 
+import asyncio
 import importlib.util
 import json
-import subprocess
 import sys
 import time
 from datetime import datetime
@@ -137,18 +150,143 @@ def _extract_archives(code_folder: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# CUDA memory
+# CUDA helpers
 # ---------------------------------------------------------------------------
 
-def _clear_cuda_memory() -> None:
+def _count_gpus() -> int:
     try:
         import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-            print("  [cuda] memory cleared")
+        return torch.cuda.device_count()
     except ImportError:
-        pass
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# Async script runner
+# ---------------------------------------------------------------------------
+
+async def _run_script_async(
+    cmd: List[str],
+    timeout: Optional[int] = 7200,
+    env: Optional[Dict[str, str]] = None,
+    max_ram_bytes: Optional[int] = None,
+    ram_check_interval: float = 5.0,
+) -> Tuple[Optional[str], Optional[str], int, float, Optional[str]]:
+    """
+    Run a script asynchronously.
+    Returns (stdout, stderr, returncode, elapsed_seconds, error_msg).
+    error_msg is None on success.
+
+    - env: overrides for environment variables (e.g. CUDA_VISIBLE_DEVICES)
+    - timeout: hard wall-clock limit in seconds; process is killed if exceeded
+    - max_ram_bytes: kill the process if its RSS (incl. children) exceeds this
+    - ram_check_interval: how often (seconds) to poll RAM
+
+    Each subprocess owns its CUDA context; all VRAM is freed by the OS on exit.
+    """
+    t0 = asyncio.get_event_loop().time()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+    except Exception as e:
+        elapsed = round(asyncio.get_event_loop().time() - t0, 2)
+        return None, None, -1, elapsed, str(e)
+
+    communicate_task = asyncio.ensure_future(proc.communicate())
+
+    # Optional RAM monitor: polls RSS of the subprocess and its children
+    monitor_task: Optional[asyncio.Task] = None
+    if max_ram_bytes is not None:
+        async def _ram_monitor() -> Optional[int]:
+            try:
+                import psutil
+                ps = psutil.Process(proc.pid)
+                while True:
+                    await asyncio.sleep(ram_check_interval)
+                    try:
+                        rss = ps.memory_info().rss
+                        for child in ps.children(recursive=True):
+                            try:
+                                rss += child.memory_info().rss
+                            except psutil.NoSuchProcess:
+                                pass
+                        if rss > max_ram_bytes:
+                            return rss
+                    except psutil.NoSuchProcess:
+                        return None  # process already gone
+            except Exception:
+                return None
+
+        monitor_task = asyncio.ensure_future(_ram_monitor())
+
+    wait_tasks = [communicate_task] + ([monitor_task] if monitor_task else [])
+
+    done, pending = await asyncio.wait(
+        wait_tasks,
+        timeout=timeout,
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    elapsed = round(asyncio.get_event_loop().time() - t0, 2)
+
+    async def _drain_and_cancel():
+        """Kill proc, drain pipes, cancel remaining tasks."""
+        proc.kill()
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(communicate_task, timeout=10.0)
+        except Exception:
+            stdout_b, stderr_b = b"", b""
+        for t in pending:
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+        return stdout_b, stderr_b
+
+    # ── Timeout ────────────────────────────────────────────────────────────
+    if not done:
+        stdout_b, stderr_b = await _drain_and_cancel()
+        return (
+            stdout_b.decode(errors="replace") or None,
+            stderr_b.decode(errors="replace") or None,
+            -1, elapsed,
+            f"Killed: timeout after {timeout}s",
+        )
+
+    # ── RAM limit exceeded ──────────────────────────────────────────────────
+    if monitor_task is not None and monitor_task in done:
+        rss = monitor_task.result()
+        stdout_b, stderr_b = await _drain_and_cancel()
+        rss_gb = (rss or 0) / 1024 ** 3
+        limit_gb = max_ram_bytes / 1024 ** 3
+        return (
+            stdout_b.decode(errors="replace") or None,
+            stderr_b.decode(errors="replace") or None,
+            -1, elapsed,
+            f"Killed: RAM {rss_gb:.1f}GB exceeded limit {limit_gb:.1f}GB",
+        )
+
+    # ── Normal completion ───────────────────────────────────────────────────
+    # Cancel the RAM monitor if it's still sleeping
+    for t in pending:
+        t.cancel()
+        try:
+            await t
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    stdout_bytes, stderr_bytes = communicate_task.result()
+    return (
+        stdout_bytes.decode(errors="replace"),
+        stderr_bytes.decode(errors="replace"),
+        proc.returncode,
+        elapsed,
+        None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +375,12 @@ class CreateSubmissionAgentEmAgent(BaseAgent):
             "competition_id", "ventilator-pressure-prediction"
         )
         additional_args: List[str] = self.agent_config.get("additional_args", [])
+        parallelism: int = max(1, int(self.agent_config.get("parallelism", 1)))
+        _timeout_raw = self.agent_config.get("timeout_per_script", 7200)
+        timeout_per_script: Optional[int] = int(_timeout_raw) if _timeout_raw else None
+        max_ram_gb: Optional[float] = self.agent_config.get("max_ram_gb")
+        ram_check_interval: float = float(self.agent_config.get("ram_check_interval", 5.0))
+        max_ram_bytes: Optional[int] = int(max_ram_gb * 1024 ** 3) if max_ram_gb else None
 
         workspace_dir = _get_workspace_dir()
         competition_dir = _get_competition_dir(competition_id)
@@ -286,6 +430,8 @@ class CreateSubmissionAgentEmAgent(BaseAgent):
         # Run at most max_steps scripts; stop when files are exhausted
         effective_steps = min(self.max_steps, len(python_files))
 
+        num_gpus = _count_gpus()
+
         print(f"Workspace:        {workspace_dir}")
         print(f"Code folder:      {code_folder}  ({len(python_files)} script(s))")
         print(f"Submissions dir:  {submissions_dir}")
@@ -294,6 +440,8 @@ class CreateSubmissionAgentEmAgent(BaseAgent):
         print(f"Test dataset:     {test_dataset_path}")
         print(f"Python files:     {len(python_files)}")
         print(f"Effective steps:  {effective_steps}")
+        print(f"Parallelism:      {parallelism}")
+        print(f"GPUs available:   {num_gpus}")
 
         await self.send_initial_messages(
             system_message=(
@@ -304,7 +452,8 @@ class CreateSubmissionAgentEmAgent(BaseAgent):
                 f"Competition: {competition_id}\n"
                 f"Running {effective_steps}/{len(python_files)} script(s) from {code_folder.name}.\n"
                 f"Train data: {train_dataset_path}\n"
-                f"Test data:  {test_dataset_path}"
+                f"Test data:  {test_dataset_path}\n"
+                f"Parallelism: {parallelism}"
             ),
             step_number=0,
         )
@@ -312,146 +461,189 @@ class CreateSubmissionAgentEmAgent(BaseAgent):
         best_score: Optional[float] = None
         best_script: Optional[str] = None
 
-        for step, py_file in enumerate(python_files[:effective_steps], 1):
+        # Split scripts into batches of `parallelism` size
+        scripts_to_run = python_files[:effective_steps]
+        batches = [
+            scripts_to_run[i : i + parallelism]
+            for i in range(0, len(scripts_to_run), parallelism)
+        ]
+
+        global_step = 0  # tracks step index across all batches
+
+        for batch in batches:
             if self.is_aborted:
                 break
 
+            # Assign a step number and GPU to each script in this batch.
+            # When parallelism > 1 and GPUs are available, each subprocess
+            # gets its own GPU via CUDA_VISIBLE_DEVICES so they don't compete
+            # for the same device's VRAM.
+            # Note: no manual cache clearing needed — each subprocess owns its
+            # own CUDA context and the OS frees all its VRAM on exit.
+            import os as _os
+            base_env = _os.environ.copy()
+
+            batch_items = []
+            for slot_idx, py_file in enumerate(batch):
+                global_step += 1
+                step = global_step
+                submission_path = submissions_dir / f"submission_{py_file.stem}.csv"
+                cmd = [
+                    sys.executable,
+                    str(py_file),
+                    "--train-dataset-path", str(train_dataset_path),
+                    "--test-dataset-path", str(test_dataset_path),
+                    "--output-submission-path", str(submission_path),
+                ] + [str(a) for a in additional_args]
+                action_id = f"action_{self.experiment_id}_{step}"
+
+                # Assign a dedicated GPU to this slot when possible
+                proc_env = base_env.copy()
+                if parallelism > 1 and num_gpus > 0:
+                    gpu_id = slot_idx % num_gpus
+                    proc_env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+                    gpu_label = f"GPU {gpu_id}"
+                else:
+                    gpu_label = f"all {num_gpus} GPU(s)" if num_gpus > 0 else "CPU"
+
+                batch_items.append((step, py_file, cmd, action_id, submission_path, proc_env, gpu_label))
+
+            batch_label = " + ".join(
+                f"step {s} ({f.name} → {gl})" for s, f, _c, _a, _sp, _e, gl in batch_items
+            )
             print(f"\n{'='*60}")
-            print(f"Step {step}/{effective_steps}: {py_file.name}")
+            print(f"Batch: {batch_label}")
             print(f"{'='*60}")
 
-            # Clear GPU memory before each step
-            _clear_cuda_memory()
+            # Phase 1: send ACTION_RECEIVED for all scripts in the batch
+            for step, py_file, cmd, action_id, submission_path, proc_env, gpu_label in batch_items:
+                thought = (
+                    f"Running {py_file.name} on {gpu_label} — "
+                    f"train={train_dataset_path.name}, test={test_dataset_path.name}"
+                )
+                await self.send_action_received(
+                    step_number=step,
+                    action_id=action_id,
+                    action_type="run_script",
+                    action_message={
+                        "role": "assistant",
+                        "content": thought,
+                        "tool_calls": None,
+                        "completion_details": None,
+                    },
+                )
 
-            # Output path that the script must write to
-            submission_path = submissions_dir / f"submission_{py_file.stem}.csv"
-
-            # Build command
-            cmd = [
-                sys.executable,
-                str(py_file),
-                "--train-dataset-path", str(train_dataset_path),
-                "--test-dataset-path", str(test_dataset_path),
-                "--output-submission-path", str(submission_path),
-            ] + [str(a) for a in additional_args]
-
-            action_id = f"action_{self.experiment_id}_{step}"
-            thought = (
-                f"Running {py_file.name} with train={train_dataset_path.name}, "
-                f"test={test_dataset_path.name}"
-            )
-
-            await self.send_action_received(
-                step_number=step,
-                action_id=action_id,
-                action_type="run_script",
-                action_message={
-                    "role": "assistant",
-                    "content": thought,
-                    "tool_calls": None,
-                    "completion_details": None,
-                },
-            )
-
-            # --- Execute the script ---
-            observation_lines = [f"$ {' '.join(cmd)}\n"]
-            score: Optional[float] = None
-            error_msg: Optional[str] = None
-            elapsed_seconds: Optional[float] = None
-
-            t0 = time.monotonic()
-            try:
-                proc = subprocess.run(
+            # Phase 2: launch all scripts concurrently; process results as they arrive.
+            # Each subprocess has its own CUDA context (CUDA_VISIBLE_DEVICES already set
+            # in proc_env). Its VRAM is freed automatically when the process exits.
+            async def _run_one(
+                step: int,
+                py_file: Path,
+                cmd: List[str],
+                action_id: str,
+                submission_path: Path,
+                proc_env: Dict[str, str],
+                gpu_label: str,
+            ):
+                stdout, stderr, returncode, elapsed, run_error = await _run_script_async(
                     cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=7200,  # 2 hours per script
+                    timeout=timeout_per_script,
+                    env=proc_env,
+                    max_ram_bytes=max_ram_bytes,
+                    ram_check_interval=ram_check_interval,
                 )
-                elapsed_seconds = round(time.monotonic() - t0, 2)
-                stdout = proc.stdout.strip()
-                stderr = proc.stderr.strip()
+                return step, py_file, cmd, action_id, submission_path, stdout, stderr, returncode, elapsed, run_error
 
-                if stdout:
-                    observation_lines.append(f"[stdout]\n{stdout}")
-                if stderr:
-                    observation_lines.append(f"[stderr]\n{stderr}")
-                observation_lines.append(f"\nExit code: {proc.returncode}  ({elapsed_seconds}s)")
+            tasks = [
+                asyncio.ensure_future(_run_one(*item))
+                for item in batch_items
+            ]
 
-                if proc.returncode != 0:
-                    error_msg = f"Script exited with code {proc.returncode}"
+            for coro in asyncio.as_completed(tasks):
+                (
+                    step, py_file, cmd, action_id, submission_path,
+                    stdout, stderr, returncode, elapsed_seconds, run_error,
+                ) = await coro
 
-            except subprocess.TimeoutExpired:
-                elapsed_seconds = round(time.monotonic() - t0, 2)
-                observation_lines.append("TIMEOUT: script exceeded 2-hour limit")
-                error_msg = "Script timed out"
-            except Exception as e:
-                elapsed_seconds = round(time.monotonic() - t0, 2)
-                observation_lines.append(f"ERROR launching script: {e}")
-                error_msg = str(e)
+                # Build observation
+                observation_lines = [f"$ {' '.join(cmd)}\n"]
+                error_msg: Optional[str] = run_error
+                score: Optional[float] = None
 
-            # --- Find submission file (path was passed explicitly to the script) ---
-            format_valid = False
-            grade_msg = "submission file not found"
+                if run_error is None:
+                    if stdout and stdout.strip():
+                        observation_lines.append(f"[stdout]\n{stdout.strip()}")
+                    if stderr and stderr.strip():
+                        observation_lines.append(f"[stderr]\n{stderr.strip()}")
+                    observation_lines.append(f"\nExit code: {returncode}  ({elapsed_seconds}s)")
+                    if returncode != 0:
+                        error_msg = f"Script exited with code {returncode}"
+                else:
+                    observation_lines.append(f"ERROR: {run_error}  ({elapsed_seconds}s)")
 
-            if submission_path.exists():
-                format_valid, score, grade_msg = _validate_and_grade(
-                    submission_path=submission_path,
-                    sample_submission_path=sample_submission_path,
-                    private_test_path=private_test_path,
-                    grade_py_path=grade_py_path,
+                # Grade
+                format_valid = False
+                grade_msg = "submission file not found"
+
+                if submission_path.exists():
+                    format_valid, score, grade_msg = _validate_and_grade(
+                        submission_path=submission_path,
+                        sample_submission_path=sample_submission_path,
+                        private_test_path=private_test_path,
+                        grade_py_path=grade_py_path,
+                    )
+                    observation_lines.append(f"\n[grading] {submission_path.name}: {grade_msg}")
+                    if not format_valid:
+                        observation_lines.append("  → Submission format invalid, skipping grade")
+                else:
+                    observation_lines.append(f"\n[grading] {submission_path.name} not found — skipping")
+
+                observation = "\n".join(observation_lines)
+                print(f"\n[step {step}] {py_file.name} finished ({elapsed_seconds}s)")
+                print(observation)
+
+                # Write grid JSON
+                grid_entry = {
+                    "python_file": str(py_file),
+                    "submission_file": str(submission_path) if submission_path.exists() else None,
+                    "score": score,
+                    "format_valid": format_valid,
+                    "grade_message": grade_msg,
+                    "execution_time_seconds": elapsed_seconds,
+                    "error": error_msg,
+                }
+                grid_path = grid_dir / f"metric_{py_file.stem}.json"
+                grid_path.write_text(json.dumps(grid_entry, indent=2))
+                print(f"  [grid] {grid_path.name} written")
+
+                # Track best (lower MAE is better)
+                if score is not None:
+                    if best_score is None or score < best_score:
+                        best_score = score
+                        best_script = py_file.name
+
+                await self.send_step_finished(
+                    step_number=step,
+                    action_id=action_id,
+                    action_type="run_script",
+                    observation_content=observation,
+                    tool_call_id=f"call_{step}",
+                    error=error_msg,
                 )
-                observation_lines.append(f"\n[grading] {submission_path.name}: {grade_msg}")
-                if not format_valid:
-                    observation_lines.append("  → Submission format invalid, skipping grade")
-            else:
-                observation_lines.append(f"\n[grading] {submission_path.name} not found — skipping")
 
-            observation = "\n".join(observation_lines)
-            print(observation)
+                await self.send_iteration_result(
+                    success=(error_msg is None and format_valid),
+                    summary=(
+                        f"{py_file.name}: {grade_msg}"
+                        if submission_path.exists()
+                        else f"{py_file.name}: no submission produced"
+                    ),
+                    score=score,
+                    approach=f"Script: {py_file.name}",
+                    step_number=step,
+                )
 
-            # --- Write grid JSON ---
-            grid_entry = {
-                "python_file": str(py_file),
-                "submission_file": str(submission_path) if submission_path.exists() else None,
-                "score": score,
-                "format_valid": format_valid,
-                "grade_message": grade_msg,
-                "execution_time_seconds": elapsed_seconds,
-                "error": error_msg,
-            }
-            grid_path = grid_dir / f"metric_{py_file.stem}.json"
-            grid_path.write_text(json.dumps(grid_entry, indent=2))
-            print(f"  [grid] {grid_path.name} written")
-
-            # Track best (lower MAE is better)
-            if score is not None:
-                if best_score is None or score < best_score:
-                    best_score = score
-                    best_script = py_file.name
-
-            await self.send_step_finished(
-                step_number=step,
-                action_id=action_id,
-                action_type="run_script",
-                observation_content=observation,
-                tool_call_id=f"call_{step}",
-                error=error_msg,
-            )
-
-            # Report iteration result (experiment stays RUNNING)
-            await self.send_iteration_result(
-                success=(error_msg is None and format_valid),
-                summary=(
-                    f"{py_file.name}: {grade_msg}"
-                    if submission_path.exists()
-                    else f"{py_file.name}: no submission produced"
-                ),
-                score=score,
-                approach=f"Script: {py_file.name}",
-                step_number=step,
-            )
-
-            self.current_step = step
+                self.current_step = max(self.current_step, step)
 
         # Final result
         await self.send_experiment_completed(

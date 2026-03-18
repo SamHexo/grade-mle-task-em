@@ -81,6 +81,10 @@ AGENT_CONFIG:
   competition_id: "ventilator-pressure-prediction"   # nom du dossier compétition
   code_folder_path: "workspace/codes"                # relatif à la racine du projet
   train_dataset_path: "workspace/train.csv"          # relatif à la racine du projet
+  parallelism: 1                                     # nb de scripts à lancer en parallèle (défaut: 1)
+  timeout_per_script: 3600                           # timeout en secondes par script (défaut: 7200)
+  max_ram_gb: 32                                     # kill si RAM > N Go, optionnel (défaut: désactivé)
+  ram_check_interval: 5.0                            # fréquence de polling RAM en secondes (défaut: 5)
   additional_args:
     - "--epochs"
     - "5"
@@ -98,6 +102,29 @@ AGENT_CONFIG:
 Tous les chemins dans `AGENT_CONFIG` sont relatifs à la **racine du projet** :
 - En local : le dossier contenant `custom_agent.py`
 - Sur Emily : `/` (donc `workspace/codes` → `/workspace/codes`)
+
+---
+
+### Parallelisme par instance Emily (GCP)
+
+Chaque subprocess a son propre contexte CUDA et sa propre VRAM. Quand il se termine, toute sa VRAM est libérée automatiquement par l'OS. Avec `parallelism > 1`, l'agent assigne automatiquement un GPU dédié à chaque subprocess via `CUDA_VISIBLE_DEVICES`.
+
+> **"Small 2x GPU"** — le "2x" est un nom de tier Emily (double RAM/vCPUs), pas 2 GPUs. Il y a toujours **1 seul L4**.
+
+| Instance Emily | Instance GCP | GPUs | VRAM/GPU | RAM système | `parallelism` | `max_ram_gb` |
+|---|---|---|---|---|---|---|
+| Small GPU | g2-standard-8 | 1× L4 | 24 GB | 32 GB | 1 | 22 |
+| Small 2x GPU | g2-standard-16 | 1× L4 | 24 GB | 64 GB | 1 | 50 |
+| Medium GPU | a2-highgpu-1g | 1× A100 | 40 GB | 85 GB | 1 | 65 |
+| Large GPU | a2-highgpu-2g | 2× A100 | 40 GB | 170 GB | **2** | **70** |
+
+Config recommandée pour **Large GPU** :
+```yaml
+AGENT_CONFIG:
+  parallelism: 2
+  timeout_per_script: 3600
+  max_ram_gb: 70
+```
 
 ---
 

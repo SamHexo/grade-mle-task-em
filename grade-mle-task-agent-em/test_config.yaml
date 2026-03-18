@@ -19,6 +19,20 @@ AGENT_CONFIG:
   # Path to the training CSV. Defaults to workspace/train.csv if omitted.
   train_dataset_path: "workspace/data/train_2b.csv"
 
+  # Parallelisme : nb de scripts lancés simultanément.
+  # Mettre = nb de GPUs disponibles. Chaque subprocess reçoit son propre GPU (CUDA_VISIBLE_DEVICES).
+  # parallelism: 1
+
+  # Timeout par script en secondes. Le process est kill si dépassé.
+  # timeout_per_script: 7200
+
+  # Kill le script si sa RAM (RSS + enfants) dépasse N Go.
+  # Voir README pour les valeurs recommandées par instance Emily.
+  # max_ram_gb: 50
+
+  # Fréquence de polling RAM en secondes (défaut: 5).
+  # ram_check_interval: 5.0
+
   # Extra args appended to every script invocation.
   additional_args:
     - "--epochs"
