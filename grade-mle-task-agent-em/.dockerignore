@@ -3,7 +3,7 @@ test_agent_locally.py
 test_config.yaml
 test_config.yaml.example
 webhooks/
-workspace
+workspace/
 # Python cache
 __pycache__/
 *.py[cod]
