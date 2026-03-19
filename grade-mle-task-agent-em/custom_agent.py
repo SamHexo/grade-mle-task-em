@@ -36,6 +36,10 @@ agent_config fields:
                                  Default: None (no limit)
     ram_check_interval   (float) How often (seconds) to poll RAM usage.
                                  Default: 5.0
+    only_files           (list)  Optional list of filenames (e.g. ["family1_deep_res_bilstm.py"])
+                                 to run. If set, only these files are executed (in the given order);
+                                 all other .py files in the code folder are ignored.
+                                 Default: None (run all files)
 """
 
 import asyncio
@@ -424,11 +428,16 @@ class CreateSubmissionAgentEmAgent(BaseAgent):
         submissions_dir = _make_run_dir(f"submissions_{self.experiment_id}")
         grades_dir = _make_run_dir(f"grades_{self.experiment_id}")
 
+        only_files: Optional[List[str]] = self.agent_config.get("only_files")
+
         # Extract any archives in code folder before iterating
         _extract_archives(code_folder)
 
         # Collect Python files in code folder (alphabetical = deterministic order)
-        python_files: List[Path] = sorted(code_folder.glob("*.py"))
+        if only_files:
+            python_files = [code_folder / f for f in only_files if (code_folder / f).exists()]
+        else:
+            python_files = sorted(code_folder.glob("*.py"))
 
         # Run at most max_steps scripts; stop when files are exhausted
         effective_steps = min(self.max_steps, len(python_files))

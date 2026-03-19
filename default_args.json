@@ -6,5 +6,6 @@
   "timeout_per_script": 0,
   "max_ram_gb": 0,
   "ram_check_interval": 0,
-  "additional_args": ["--gradient-steps", "5", "--kfold", "5", "--lr", "0.001", "--batch-size", "512"]
+  "additional_args": ["--gradient-steps", "5", "--kfold", "5", "--lr", "0.001", "--batch-size", "512"],
+  "only_files": null
 }
