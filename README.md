@@ -18,7 +18,7 @@ workspace/
 ├── submissions_<experiment_id>/   ← créé automatiquement
 │   ├── submission_model_a.csv
 │   └── submission_model_b.csv
-└── grid_<experiment_id>/          ← créé automatiquement
+└── grades_<experiment_id>/          ← créé automatiquement
     ├── metric_model_a.json
     └── metric_model_b.json
 
@@ -166,7 +166,7 @@ Les webhooks sont sauvegardés dans `webhooks/` pour inspection.
 ### `workspace/submissions_<experiment_id>/submission_<script_stem>.csv`
 Le fichier de soumission produit par le script.
 
-### `workspace/grid_<experiment_id>/metric_<script_stem>.json`
+### `workspace/grades_<experiment_id>/metric_<script_stem>.json`
 Les métriques du step :
 ```json
 {

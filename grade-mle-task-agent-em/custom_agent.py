@@ -72,7 +72,7 @@ def _get_workspace_dir() -> Path:
 
 
 def _get_competition_dir(competition_id: str) -> Path:
-    return _get_base_dir() / competition_id
+    return Path(__file__).parent / competition_id
 
 
 # ---------------------------------------------------------------------------
@@ -422,7 +422,7 @@ class CreateSubmissionAgentEmAgent(BaseAgent):
             return candidate
 
         submissions_dir = _make_run_dir(f"submissions_{self.experiment_id}")
-        grid_dir = _make_run_dir(f"grid_{self.experiment_id}")
+        grades_dir = _make_run_dir(f"grades_{self.experiment_id}")
 
         # Extract any archives in code folder before iterating
         _extract_archives(code_folder)
@@ -605,8 +605,8 @@ class CreateSubmissionAgentEmAgent(BaseAgent):
                 print(f"\n[step {step}] {py_file.name} finished ({elapsed_seconds}s)")
                 print(observation)
 
-                # Write grid JSON
-                grid_entry = {
+                # Write grades JSON
+                grades_entry = {
                     "python_file": str(py_file),
                     "submission_file": str(submission_path) if submission_path.exists() else None,
                     "score": score,
@@ -615,9 +615,9 @@ class CreateSubmissionAgentEmAgent(BaseAgent):
                     "execution_time_seconds": elapsed_seconds,
                     "error": error_msg,
                 }
-                grid_path = grid_dir / f"metric_{py_file.stem}.json"
-                grid_path.write_text(json.dumps(grid_entry, indent=2))
-                print(f"  [grid] {grid_path.name} written")
+                grades_path = grades_dir / f"metric_{py_file.stem}.json"
+                grades_path.write_text(json.dumps(grades_entry, indent=2))
+                print(f"  [grades] {grades_path.name} written")
 
                 # Track best (lower MAE is better)
                 if score is not None:
