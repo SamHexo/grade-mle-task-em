@@ -24,9 +24,12 @@ agent_config fields:
     additional_args      (list)  Extra CLI args appended to every invocation.
                                  Default: []
     parallelism          (int)   Number of scripts to run simultaneously.
-                                 Scripts are batched in groups of this size;
-                                 within a batch all run concurrently and results
-                                 are reported as each one finishes.
+                                 In checkpoint mode (by_script): scripts are batched;
+                                 each batch runs concurrently, every script executing
+                                 its full checkpoint sequence on its own GPU.
+                                 In checkpoint mode (by_step): within each step, scripts
+                                 are batched and run concurrently before advancing.
+                                 In batch mode (no checkpoint_steps): same as before.
                                  Default: 1 (sequential)
     timeout_per_script   (int)   Hard timeout in seconds per script.
                                  The subprocess is killed if it exceeds this.
@@ -607,210 +610,174 @@ class CreateSubmissionAgentEmAgent(BaseAgent):
             checkpoint_dir = submissions_dir / "checkpoints"
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-            for py_file in (scripts_to_run if checkpoint_order != "by_step" else []):
-                if self.is_aborted:
-                    break
-
-                # Resolve full checkpoint steps for this script
-                if checkpoint_steps_set:
-                    full_steps = sorted(checkpoint_steps_set)
-                else:
-                    # No checkpoint_steps: use --gradient-steps from additional_args as the single full checkpoint
-                    gs = _extract_gradient_steps([str(a) for a in additional_args])
-                    full_steps = [gs] if gs else []
-
-                if not full_steps:
-                    print(f"WARNING: No gradient steps resolved for {py_file.name}, skipping")
-                    continue
-
-                max_step = max(full_steps)
-                full_steps_set = set(full_steps)
-
-                # Build merged timeline
-                if _patience_every_int:
-                    all_steps = sorted(set(
-                        list(range(_patience_every_int, max_step, _patience_every_int)) +
-                        list(full_steps_set) +
-                        [max_step]
-                    ))
-                else:
-                    all_steps = sorted(full_steps_set)
-
-                timeline = [(s, s in full_steps_set) for s in all_steps]
-
-                checkpoint_path = checkpoint_dir / f"{py_file.stem}.ckpt"
-                best_ckpt_val: Optional[float] = None
-                patience_counter = 0
-                early_stopped = False
-
-                for ckpt_step, is_full in timeline:
-                    if self.is_aborted or early_stopped:
+            if checkpoint_order != "by_step":
+                _ckpt_batches = [
+                    scripts_to_run[i:i + parallelism]
+                    for i in range(0, len(scripts_to_run), parallelism)
+                ]
+                for _ckpt_batch in _ckpt_batches:
+                    if self.is_aborted:
                         break
 
-                    cmd = [
-                        sys.executable,
-                        str(py_file),
-                        "--train-dataset-path", str(train_dataset_path),
-                        "--test-dataset-path", str(test_dataset_path),
-                        "--gradient-steps", str(ckpt_step),
-                        "--checkpoint-path", str(checkpoint_path),
-                    ] + filtered_additional_args
+                    async def _run_script_ckpt_seq(py_file, slot_idx):
+                        nonlocal global_step, best_score, best_script
+                        proc_env = base_env.copy()
+                        if parallelism > 1 and num_gpus > 0:
+                            proc_env["CUDA_VISIBLE_DEVICES"] = str(slot_idx % num_gpus)
 
-                    if is_full:
-                        global_step += 1
-                        step = global_step
-                        submission_path = submissions_dir / f"submission_{py_file.stem}_step{ckpt_step}.csv"
-                        action_id = f"action_{self.experiment_id}_{step}"
-                        cmd += ["--output-submission-path", str(submission_path)]
-
-                        thought = (
-                            f"Running {py_file.name} — full checkpoint at step {ckpt_step} "
-                            f"(train={train_dataset_path.name}, test={test_dataset_path.name})"
-                        )
-                        await self.send_action_received(
-                            step_number=step,
-                            action_id=action_id,
-                            action_type="run_script",
-                            action_message={
-                                "role": "assistant",
-                                "content": thought,
-                                "tool_calls": None,
-                                "completion_details": None,
-                            },
-                        )
-                    else:
-                        submission_path = None
-
-                    check_type = "FULL" if is_full else "patience"
-                    print(f"\n{'='*60}")
-                    print(f"{check_type}: {py_file.name} @ gradient_steps={ckpt_step}")
-                    print(f"{'='*60}")
-
-                    stdout, stderr, returncode, elapsed_seconds, run_error = await _run_script_async(
-                        cmd,
-                        timeout=timeout_per_script,
-                        env=base_env,
-                        max_ram_bytes=max_ram_bytes,
-                        ram_check_interval=ram_check_interval,
-                    )
-
-                    # Early stopping: parse val score from stdout
-                    val_score = _parse_val_score(stdout)
-                    check_type_label = "FULL checkpoint" if is_full else "patience check"
-
-                    # Always log val score
-                    if val_score is not None:
-                        improved = best_ckpt_val is None or val_score < best_ckpt_val
-                        if improved:
-                            delta_str = f" (↓ {best_ckpt_val - val_score:.4f})" if best_ckpt_val is not None else " (first)"
-                            best_ckpt_val = val_score
-                            patience_counter = 0
-                            print(f"  [{check_type_label}] step={ckpt_step}, val={val_score:.4f}{delta_str} ✓ new best, elapsed={elapsed_seconds}s")
+                        if checkpoint_steps_set:
+                            full_steps = sorted(checkpoint_steps_set)
                         else:
-                            patience_counter += 1
-                            patience_str = f"  patience={patience_counter}/{early_stopping_patience}" if early_stopping_patience else ""
-                            print(f"  [{check_type_label}] step={ckpt_step}, val={val_score:.4f} (best={best_ckpt_val:.4f}){patience_str}, elapsed={elapsed_seconds}s")
-                            if early_stopping_patience and patience_counter >= early_stopping_patience:
-                                print(f"  [early stopping] No improvement for {patience_counter} checks. Stopping {py_file.name}.")
-                                early_stopped = True
-                    else:
-                        print(f"  [{check_type_label}] step={ckpt_step}, val=N/A (could not parse), elapsed={elapsed_seconds}s")
-                        if run_error:
-                            print(f"  ERROR: {run_error}")
+                            gs = _extract_gradient_steps([str(a) for a in additional_args])
+                            full_steps = [gs] if gs else []
+                        if not full_steps:
+                            print(f"WARNING: No gradient steps resolved for {py_file.name}, skipping")
+                            return
+                        max_step = max(full_steps)
+                        full_steps_set = set(full_steps)
+                        if _patience_every_int:
+                            all_steps = sorted(set(
+                                list(range(_patience_every_int, max_step, _patience_every_int)) +
+                                list(full_steps_set) + [max_step]
+                            ))
+                        else:
+                            all_steps = sorted(full_steps_set)
+                        timeline = [(s, s in full_steps_set) for s in all_steps]
+                        checkpoint_path = checkpoint_dir / f"{py_file.stem}.ckpt"
+                        best_ckpt_val: Optional[float] = None
+                        patience_counter = 0
+                        early_stopped = False
 
-                    if not is_full:
-                        # Patience-only: log and continue, no Emily step
-                        continue
-
-                    # Full checkpoint: grade + Emily step
-                    observation_lines = [f"$ {' '.join(cmd)}\n"]
-                    error_msg: Optional[str] = run_error
-                    score: Optional[float] = None
-
-                    if run_error is None:
-                        if stdout and stdout.strip():
-                            stdout_lines = stdout.strip().splitlines()
-                            if len(stdout_lines) > 30:
-                                stdout_tail = "\n".join(stdout_lines[-30:])
-                                observation_lines.append(f"[stdout] (last 30 of {len(stdout_lines)} lines)\n{stdout_tail}")
+                        for ckpt_step, is_full in timeline:
+                            if self.is_aborted or early_stopped:
+                                break
+                            cmd = [
+                                sys.executable, str(py_file),
+                                "--train-dataset-path", str(train_dataset_path),
+                                "--test-dataset-path", str(test_dataset_path),
+                                "--gradient-steps", str(ckpt_step),
+                                "--checkpoint-path", str(checkpoint_path),
+                            ] + filtered_additional_args
+                            if is_full:
+                                global_step += 1
+                                step = global_step
+                                submission_path = submissions_dir / f"submission_{py_file.stem}_step{ckpt_step}.csv"
+                                action_id = f"action_{self.experiment_id}_{step}"
+                                cmd += ["--output-submission-path", str(submission_path)]
+                                thought = (
+                                    f"Running {py_file.name} — full checkpoint at step {ckpt_step} "
+                                    f"(train={train_dataset_path.name}, test={test_dataset_path.name})"
+                                )
+                                await self.send_action_received(
+                                    step_number=step, action_id=action_id, action_type="run_script",
+                                    action_message={"role": "assistant", "content": thought,
+                                                    "tool_calls": None, "completion_details": None},
+                                )
                             else:
-                                observation_lines.append(f"[stdout]\n{stdout.strip()}")
-                        if stderr and stderr.strip():
-                            observation_lines.append(f"[stderr]\n{stderr.strip()}")
-                        observation_lines.append(f"\nExit code: {returncode}  ({elapsed_seconds}s)")
-                        if returncode != 0:
-                            error_msg = f"Script exited with code {returncode}"
-                    else:
-                        observation_lines.append(f"ERROR: {run_error}  ({elapsed_seconds}s)")
+                                submission_path = None
+                            check_type = "FULL" if is_full else "patience"
+                            print(f"\n{'='*60}")
+                            print(f"{check_type}: {py_file.name} @ gradient_steps={ckpt_step}")
+                            print(f"{'='*60}")
+                            stdout, stderr, returncode, elapsed_seconds, run_error = await _run_script_async(
+                                cmd, timeout=timeout_per_script, env=proc_env,
+                                max_ram_bytes=max_ram_bytes, ram_check_interval=ram_check_interval,
+                            )
+                            val_score = _parse_val_score(stdout)
+                            check_type_label = "FULL checkpoint" if is_full else "patience check"
+                            if val_score is not None:
+                                improved = best_ckpt_val is None or val_score < best_ckpt_val
+                                if improved:
+                                    delta_str = f" (↓ {best_ckpt_val - val_score:.4f})" if best_ckpt_val is not None else " (first)"
+                                    best_ckpt_val = val_score
+                                    patience_counter = 0
+                                    print(f"  [{check_type_label}] step={ckpt_step}, val={val_score:.4f}{delta_str} ✓ new best, elapsed={elapsed_seconds}s")
+                                else:
+                                    patience_counter += 1
+                                    patience_str = f"  patience={patience_counter}/{early_stopping_patience}" if early_stopping_patience else ""
+                                    print(f"  [{check_type_label}] step={ckpt_step}, val={val_score:.4f} (best={best_ckpt_val:.4f}){patience_str}, elapsed={elapsed_seconds}s")
+                                    if early_stopping_patience and patience_counter >= early_stopping_patience:
+                                        print(f"  [early stopping] No improvement for {patience_counter} checks. Stopping {py_file.name}.")
+                                        early_stopped = True
+                            else:
+                                print(f"  [{check_type_label}] step={ckpt_step}, val=N/A (could not parse), elapsed={elapsed_seconds}s")
+                                if run_error:
+                                    print(f"  ERROR: {run_error}")
+                            if not is_full:
+                                continue
+                            observation_lines = [f"$ {' '.join(cmd)}\n"]
+                            error_msg: Optional[str] = run_error
+                            score: Optional[float] = None
+                            if run_error is None:
+                                if stdout and stdout.strip():
+                                    stdout_lines = stdout.strip().splitlines()
+                                    if len(stdout_lines) > 30:
+                                        stdout_tail = "\n".join(stdout_lines[-30:])
+                                        observation_lines.append(f"[stdout] (last 30 of {len(stdout_lines)} lines)\n{stdout_tail}")
+                                    else:
+                                        observation_lines.append(f"[stdout]\n{stdout.strip()}")
+                                if stderr and stderr.strip():
+                                    observation_lines.append(f"[stderr]\n{stderr.strip()}")
+                                observation_lines.append(f"\nExit code: {returncode}  ({elapsed_seconds}s)")
+                                if returncode != 0:
+                                    error_msg = f"Script exited with code {returncode}"
+                            else:
+                                observation_lines.append(f"ERROR: {run_error}  ({elapsed_seconds}s)")
+                            format_valid = False
+                            grade_msg = "submission file not found"
+                            if submission_path and submission_path.exists():
+                                format_valid, score, grade_msg = _validate_and_grade(
+                                    submission_path=submission_path,
+                                    sample_submission_path=sample_submission_path,
+                                    private_test_path=private_test_path,
+                                    grade_py_path=grade_py_path,
+                                )
+                                observation_lines.append(f"\n[grading] {submission_path.name}: {grade_msg}")
+                                if not format_valid:
+                                    observation_lines.append("  → Submission format invalid, skipping grade")
+                            else:
+                                observation_lines.append(f"\n[grading] submission not found — skipping")
+                            if early_stopped:
+                                observation_lines.append(
+                                    f"\n[early stopping] Stopped after {patience_counter} checks without improvement "
+                                    f"(best val={best_ckpt_val:.4f})."
+                                )
+                            observation = "\n".join(observation_lines)
+                            print(f"\n[step {step}] {py_file.name} @{ckpt_step} finished ({elapsed_seconds}s)")
+                            print(observation)
+                            grades_entry = {
+                                "python_file": str(py_file),
+                                "gradient_steps": ckpt_step,
+                                "submission_file": str(submission_path) if submission_path and submission_path.exists() else None,
+                                "score": score, "format_valid": format_valid, "grade_message": grade_msg,
+                                "execution_time_seconds": elapsed_seconds, "error": error_msg,
+                                "early_stopped": early_stopped,
+                            }
+                            grades_path = grades_dir / f"metric_{py_file.stem}_step{ckpt_step}.json"
+                            grades_path.write_text(json.dumps(grades_entry, indent=2))
+                            print(f"  [grades] {grades_path.name} written")
+                            if score is not None:
+                                if best_score is None or score < best_score:
+                                    best_score = score
+                                    best_script = f"{py_file.name}@step{ckpt_step}"
+                            await self.send_step_finished(
+                                step_number=step, action_id=action_id, action_type="run_script",
+                                observation_content=observation, tool_call_id=f"call_{step}", error=error_msg,
+                            )
+                            await self.send_iteration_result(
+                                success=(error_msg is None and format_valid),
+                                summary=(
+                                    f"{py_file.name}@step{ckpt_step}: {grade_msg}"
+                                    if submission_path and submission_path.exists()
+                                    else f"{py_file.name}@step{ckpt_step}: no submission produced"
+                                ),
+                                score=score,
+                                approach=f"Script: {py_file.name}, gradient_steps={ckpt_step}",
+                                step_number=step,
+                            )
+                            self.current_step = max(self.current_step, step)
 
-                    format_valid = False
-                    grade_msg = "submission file not found"
-
-                    if submission_path and submission_path.exists():
-                        format_valid, score, grade_msg = _validate_and_grade(
-                            submission_path=submission_path,
-                            sample_submission_path=sample_submission_path,
-                            private_test_path=private_test_path,
-                            grade_py_path=grade_py_path,
-                        )
-                        observation_lines.append(f"\n[grading] {submission_path.name}: {grade_msg}")
-                        if not format_valid:
-                            observation_lines.append("  → Submission format invalid, skipping grade")
-                    else:
-                        observation_lines.append(f"\n[grading] submission not found — skipping")
-
-                    if early_stopped:
-                        observation_lines.append(
-                            f"\n[early stopping] Stopped after {patience_counter} checks without improvement "
-                            f"(best val={best_ckpt_val:.4f})."
-                        )
-
-                    observation = "\n".join(observation_lines)
-                    print(f"\n[step {step}] {py_file.name} @{ckpt_step} finished ({elapsed_seconds}s)")
-                    print(observation)
-
-                    grades_entry = {
-                        "python_file": str(py_file),
-                        "gradient_steps": ckpt_step,
-                        "submission_file": str(submission_path) if submission_path and submission_path.exists() else None,
-                        "score": score,
-                        "format_valid": format_valid,
-                        "grade_message": grade_msg,
-                        "execution_time_seconds": elapsed_seconds,
-                        "error": error_msg,
-                        "early_stopped": early_stopped,
-                    }
-                    grades_path = grades_dir / f"metric_{py_file.stem}_step{ckpt_step}.json"
-                    grades_path.write_text(json.dumps(grades_entry, indent=2))
-                    print(f"  [grades] {grades_path.name} written")
-
-                    if score is not None:
-                        if best_score is None or score < best_score:
-                            best_score = score
-                            best_script = f"{py_file.name}@step{ckpt_step}"
-
-                    await self.send_step_finished(
-                        step_number=step,
-                        action_id=action_id,
-                        action_type="run_script",
-                        observation_content=observation,
-                        tool_call_id=f"call_{step}",
-                        error=error_msg,
-                    )
-
-                    await self.send_iteration_result(
-                        success=(error_msg is None and format_valid),
-                        summary=(
-                            f"{py_file.name}@step{ckpt_step}: {grade_msg}"
-                            if submission_path and submission_path.exists()
-                            else f"{py_file.name}@step{ckpt_step}: no submission produced"
-                        ),
-                        score=score,
-                        approach=f"Script: {py_file.name}, gradient_steps={ckpt_step}",
-                        step_number=step,
-                    )
-
-                    self.current_step = max(self.current_step, step)
+                    await asyncio.gather(*[_run_script_ckpt_seq(pf, i) for i, pf in enumerate(_ckpt_batch)])
 
             if checkpoint_order == "by_step":
                 # Build global timeline (shared across all scripts — same checkpoint_steps for all)
@@ -843,181 +810,156 @@ class CreateSubmissionAgentEmAgent(BaseAgent):
                     for ckpt_step, is_full in _bs_timeline:
                         if self.is_aborted:
                             break
-                        for py_file in scripts_to_run:
-                            if self.is_aborted or _bs_stopped[py_file]:
-                                continue
+                        _bs_step_batches = [
+                            scripts_to_run[i:i + parallelism]
+                            for i in range(0, len(scripts_to_run), parallelism)
+                        ]
+                        for _bs_step_batch in _bs_step_batches:
+                            if self.is_aborted:
+                                break
 
-                            checkpoint_path = _bs_ckpt_path[py_file]
-                            best_ckpt_val = _bs_best_val[py_file]
-                            patience_counter = _bs_patience[py_file]
-                            early_stopped = False
-
-                            cmd = [
-                                sys.executable,
-                                str(py_file),
-                                "--train-dataset-path", str(train_dataset_path),
-                                "--test-dataset-path", str(test_dataset_path),
-                                "--gradient-steps", str(ckpt_step),
-                                "--checkpoint-path", str(checkpoint_path),
-                            ] + filtered_additional_args
-
-                            if is_full:
-                                global_step += 1
-                                step = global_step
-                                submission_path = submissions_dir / f"submission_{py_file.stem}_step{ckpt_step}.csv"
-                                action_id = f"action_{self.experiment_id}_{step}"
-                                cmd += ["--output-submission-path", str(submission_path)]
-
-                                thought = (
-                                    f"Running {py_file.name} — full checkpoint at step {ckpt_step} "
-                                    f"(train={train_dataset_path.name}, test={test_dataset_path.name})"
-                                )
-                                await self.send_action_received(
-                                    step_number=step,
-                                    action_id=action_id,
-                                    action_type="run_script",
-                                    action_message={
-                                        "role": "assistant",
-                                        "content": thought,
-                                        "tool_calls": None,
-                                        "completion_details": None,
-                                    },
-                                )
-                            else:
-                                submission_path = None
-
-                            check_type = "FULL" if is_full else "patience"
-                            print(f"\n{'='*60}")
-                            print(f"{check_type}: {py_file.name} @ gradient_steps={ckpt_step}")
-                            print(f"{'='*60}")
-
-                            stdout, stderr, returncode, elapsed_seconds, run_error = await _run_script_async(
-                                cmd,
-                                timeout=timeout_per_script,
-                                env=base_env,
-                                max_ram_bytes=max_ram_bytes,
-                                ram_check_interval=ram_check_interval,
-                            )
-
-                            val_score = _parse_val_score(stdout)
-                            check_type_label = "FULL checkpoint" if is_full else "patience check"
-
-                            if val_score is not None:
-                                improved = best_ckpt_val is None or val_score < best_ckpt_val
-                                if improved:
-                                    delta_str = f" (↓ {best_ckpt_val - val_score:.4f})" if best_ckpt_val is not None else " (first)"
-                                    best_ckpt_val = val_score
-                                    patience_counter = 0
-                                    print(f"  [{check_type_label}] step={ckpt_step}, val={val_score:.4f}{delta_str} ✓ new best, elapsed={elapsed_seconds}s")
+                            async def _run_script_at_step(py_file, slot_idx):
+                                nonlocal global_step, best_score, best_script
+                                if _bs_stopped[py_file]:
+                                    return
+                                proc_env = base_env.copy()
+                                if parallelism > 1 and num_gpus > 0:
+                                    proc_env["CUDA_VISIBLE_DEVICES"] = str(slot_idx % num_gpus)
+                                checkpoint_path = _bs_ckpt_path[py_file]
+                                best_ckpt_val = _bs_best_val[py_file]
+                                patience_counter = _bs_patience[py_file]
+                                early_stopped = False
+                                cmd = [
+                                    sys.executable, str(py_file),
+                                    "--train-dataset-path", str(train_dataset_path),
+                                    "--test-dataset-path", str(test_dataset_path),
+                                    "--gradient-steps", str(ckpt_step),
+                                    "--checkpoint-path", str(checkpoint_path),
+                                ] + filtered_additional_args
+                                if is_full:
+                                    global_step += 1
+                                    step = global_step
+                                    submission_path = submissions_dir / f"submission_{py_file.stem}_step{ckpt_step}.csv"
+                                    action_id = f"action_{self.experiment_id}_{step}"
+                                    cmd += ["--output-submission-path", str(submission_path)]
+                                    thought = (
+                                        f"Running {py_file.name} — full checkpoint at step {ckpt_step} "
+                                        f"(train={train_dataset_path.name}, test={test_dataset_path.name})"
+                                    )
+                                    await self.send_action_received(
+                                        step_number=step, action_id=action_id, action_type="run_script",
+                                        action_message={"role": "assistant", "content": thought,
+                                                        "tool_calls": None, "completion_details": None},
+                                    )
                                 else:
-                                    patience_counter += 1
-                                    patience_str = f"  patience={patience_counter}/{early_stopping_patience}" if early_stopping_patience else ""
-                                    print(f"  [{check_type_label}] step={ckpt_step}, val={val_score:.4f} (best={best_ckpt_val:.4f}){patience_str}, elapsed={elapsed_seconds}s")
-                                    if early_stopping_patience and patience_counter >= early_stopping_patience:
-                                        print(f"  [early stopping] No improvement for {patience_counter} checks. Stopping {py_file.name}.")
-                                        early_stopped = True
-                            else:
-                                print(f"  [{check_type_label}] step={ckpt_step}, val=N/A (could not parse), elapsed={elapsed_seconds}s")
-                                if run_error:
-                                    print(f"  ERROR: {run_error}")
-
-                            _bs_best_val[py_file] = best_ckpt_val
-                            _bs_patience[py_file] = patience_counter
-                            if early_stopped:
-                                _bs_stopped[py_file] = True
-
-                            if not is_full:
-                                continue
-
-                            # Full checkpoint: grade + Emily step
-                            observation_lines = [f"$ {' '.join(cmd)}\n"]
-                            error_msg: Optional[str] = run_error
-                            score: Optional[float] = None
-
-                            if run_error is None:
-                                if stdout and stdout.strip():
-                                    stdout_lines = stdout.strip().splitlines()
-                                    if len(stdout_lines) > 30:
-                                        stdout_tail = "\n".join(stdout_lines[-30:])
-                                        observation_lines.append(f"[stdout] (last 30 of {len(stdout_lines)} lines)\n{stdout_tail}")
+                                    submission_path = None
+                                check_type = "FULL" if is_full else "patience"
+                                print(f"\n{'='*60}")
+                                print(f"{check_type}: {py_file.name} @ gradient_steps={ckpt_step}")
+                                print(f"{'='*60}")
+                                stdout, stderr, returncode, elapsed_seconds, run_error = await _run_script_async(
+                                    cmd, timeout=timeout_per_script, env=proc_env,
+                                    max_ram_bytes=max_ram_bytes, ram_check_interval=ram_check_interval,
+                                )
+                                val_score = _parse_val_score(stdout)
+                                check_type_label = "FULL checkpoint" if is_full else "patience check"
+                                if val_score is not None:
+                                    improved = best_ckpt_val is None or val_score < best_ckpt_val
+                                    if improved:
+                                        delta_str = f" (↓ {best_ckpt_val - val_score:.4f})" if best_ckpt_val is not None else " (first)"
+                                        best_ckpt_val = val_score
+                                        patience_counter = 0
+                                        print(f"  [{check_type_label}] step={ckpt_step}, val={val_score:.4f}{delta_str} ✓ new best, elapsed={elapsed_seconds}s")
                                     else:
-                                        observation_lines.append(f"[stdout]\n{stdout.strip()}")
-                                if stderr and stderr.strip():
-                                    observation_lines.append(f"[stderr]\n{stderr.strip()}")
-                                observation_lines.append(f"\nExit code: {returncode}  ({elapsed_seconds}s)")
-                                if returncode != 0:
-                                    error_msg = f"Script exited with code {returncode}"
-                            else:
-                                observation_lines.append(f"ERROR: {run_error}  ({elapsed_seconds}s)")
-
-                            format_valid = False
-                            grade_msg = "submission file not found"
-
-                            if submission_path and submission_path.exists():
-                                format_valid, score, grade_msg = _validate_and_grade(
-                                    submission_path=submission_path,
-                                    sample_submission_path=sample_submission_path,
-                                    private_test_path=private_test_path,
-                                    grade_py_path=grade_py_path,
+                                        patience_counter += 1
+                                        patience_str = f"  patience={patience_counter}/{early_stopping_patience}" if early_stopping_patience else ""
+                                        print(f"  [{check_type_label}] step={ckpt_step}, val={val_score:.4f} (best={best_ckpt_val:.4f}){patience_str}, elapsed={elapsed_seconds}s")
+                                        if early_stopping_patience and patience_counter >= early_stopping_patience:
+                                            print(f"  [early stopping] No improvement for {patience_counter} checks. Stopping {py_file.name}.")
+                                            early_stopped = True
+                                else:
+                                    print(f"  [{check_type_label}] step={ckpt_step}, val=N/A (could not parse), elapsed={elapsed_seconds}s")
+                                    if run_error:
+                                        print(f"  ERROR: {run_error}")
+                                _bs_best_val[py_file] = best_ckpt_val
+                                _bs_patience[py_file] = patience_counter
+                                if early_stopped:
+                                    _bs_stopped[py_file] = True
+                                if not is_full:
+                                    return
+                                observation_lines = [f"$ {' '.join(cmd)}\n"]
+                                error_msg: Optional[str] = run_error
+                                score: Optional[float] = None
+                                if run_error is None:
+                                    if stdout and stdout.strip():
+                                        stdout_lines = stdout.strip().splitlines()
+                                        if len(stdout_lines) > 30:
+                                            stdout_tail = "\n".join(stdout_lines[-30:])
+                                            observation_lines.append(f"[stdout] (last 30 of {len(stdout_lines)} lines)\n{stdout_tail}")
+                                        else:
+                                            observation_lines.append(f"[stdout]\n{stdout.strip()}")
+                                    if stderr and stderr.strip():
+                                        observation_lines.append(f"[stderr]\n{stderr.strip()}")
+                                    observation_lines.append(f"\nExit code: {returncode}  ({elapsed_seconds}s)")
+                                    if returncode != 0:
+                                        error_msg = f"Script exited with code {returncode}"
+                                else:
+                                    observation_lines.append(f"ERROR: {run_error}  ({elapsed_seconds}s)")
+                                format_valid = False
+                                grade_msg = "submission file not found"
+                                if submission_path and submission_path.exists():
+                                    format_valid, score, grade_msg = _validate_and_grade(
+                                        submission_path=submission_path,
+                                        sample_submission_path=sample_submission_path,
+                                        private_test_path=private_test_path,
+                                        grade_py_path=grade_py_path,
+                                    )
+                                    observation_lines.append(f"\n[grading] {submission_path.name}: {grade_msg}")
+                                    if not format_valid:
+                                        observation_lines.append("  → Submission format invalid, skipping grade")
+                                else:
+                                    observation_lines.append(f"\n[grading] submission not found — skipping")
+                                if early_stopped:
+                                    observation_lines.append(
+                                        f"\n[early stopping] Stopped after {patience_counter} checks without improvement "
+                                        f"(best val={best_ckpt_val:.4f})."
+                                    )
+                                observation = "\n".join(observation_lines)
+                                print(f"\n[step {step}] {py_file.name} @{ckpt_step} finished ({elapsed_seconds}s)")
+                                print(observation)
+                                grades_entry = {
+                                    "python_file": str(py_file),
+                                    "gradient_steps": ckpt_step,
+                                    "submission_file": str(submission_path) if submission_path and submission_path.exists() else None,
+                                    "score": score, "format_valid": format_valid, "grade_message": grade_msg,
+                                    "execution_time_seconds": elapsed_seconds, "error": error_msg,
+                                    "early_stopped": early_stopped,
+                                }
+                                grades_path = grades_dir / f"metric_{py_file.stem}_step{ckpt_step}.json"
+                                grades_path.write_text(json.dumps(grades_entry, indent=2))
+                                print(f"  [grades] {grades_path.name} written")
+                                if score is not None:
+                                    if best_score is None or score < best_score:
+                                        best_score = score
+                                        best_script = f"{py_file.name}@step{ckpt_step}"
+                                await self.send_step_finished(
+                                    step_number=step, action_id=action_id, action_type="run_script",
+                                    observation_content=observation, tool_call_id=f"call_{step}", error=error_msg,
                                 )
-                                observation_lines.append(f"\n[grading] {submission_path.name}: {grade_msg}")
-                                if not format_valid:
-                                    observation_lines.append("  → Submission format invalid, skipping grade")
-                            else:
-                                observation_lines.append(f"\n[grading] submission not found — skipping")
-
-                            if early_stopped:
-                                observation_lines.append(
-                                    f"\n[early stopping] Stopped after {patience_counter} checks without improvement "
-                                    f"(best val={best_ckpt_val:.4f})."
+                                await self.send_iteration_result(
+                                    success=(error_msg is None and format_valid),
+                                    summary=(
+                                        f"{py_file.name}@step{ckpt_step}: {grade_msg}"
+                                        if submission_path and submission_path.exists()
+                                        else f"{py_file.name}@step{ckpt_step}: no submission produced"
+                                    ),
+                                    score=score,
+                                    approach=f"Script: {py_file.name}, gradient_steps={ckpt_step}",
+                                    step_number=step,
                                 )
+                                self.current_step = max(self.current_step, step)
 
-                            observation = "\n".join(observation_lines)
-                            print(f"\n[step {step}] {py_file.name} @{ckpt_step} finished ({elapsed_seconds}s)")
-                            print(observation)
-
-                            grades_entry = {
-                                "python_file": str(py_file),
-                                "gradient_steps": ckpt_step,
-                                "submission_file": str(submission_path) if submission_path and submission_path.exists() else None,
-                                "score": score,
-                                "format_valid": format_valid,
-                                "grade_message": grade_msg,
-                                "execution_time_seconds": elapsed_seconds,
-                                "error": error_msg,
-                                "early_stopped": early_stopped,
-                            }
-                            grades_path = grades_dir / f"metric_{py_file.stem}_step{ckpt_step}.json"
-                            grades_path.write_text(json.dumps(grades_entry, indent=2))
-                            print(f"  [grades] {grades_path.name} written")
-
-                            if score is not None:
-                                if best_score is None or score < best_score:
-                                    best_score = score
-                                    best_script = f"{py_file.name}@step{ckpt_step}"
-
-                            await self.send_step_finished(
-                                step_number=step,
-                                action_id=action_id,
-                                action_type="run_script",
-                                observation_content=observation,
-                                tool_call_id=f"call_{step}",
-                                error=error_msg,
-                            )
-
-                            await self.send_iteration_result(
-                                success=(error_msg is None and format_valid),
-                                summary=(
-                                    f"{py_file.name}@step{ckpt_step}: {grade_msg}"
-                                    if submission_path and submission_path.exists()
-                                    else f"{py_file.name}@step{ckpt_step}: no submission produced"
-                                ),
-                                score=score,
-                                approach=f"Script: {py_file.name}, gradient_steps={ckpt_step}",
-                                step_number=step,
-                            )
-
-                            self.current_step = max(self.current_step, step)
+                            await asyncio.gather(*[_run_script_at_step(pf, i) for i, pf in enumerate(_bs_step_batch)])
 
         else:
             # Original batch mode (no checkpointing)

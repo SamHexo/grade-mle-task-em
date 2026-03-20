@@ -21,7 +21,8 @@ AGENT_CONFIG:
   train_dataset_path: "workspace/data/train_2b.csv"
 
   # Nb de scripts lancés simultanément. Mettre = nb de GPUs disponibles.
-  # Ignoré si checkpoint_steps est activé.
+  # En mode checkpoint : by_script → batch de scripts tournent en parallèle (chacun sa séquence complète).
+  #                      by_step   → à chaque step, batch de scripts tournent en parallèle.
   # Default: 1
   parallelism: 3
 
